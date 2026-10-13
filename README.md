@@ -1,4 +1,4 @@
-# nudgelan-agent-bin
+# NudgeLAN Linux
 
 Binary releases of the NudgeLAN Linux companion for Omarchy.
 
