@@ -1,0 +1,280 @@
+# pacman runs this as root after the files are in place. It turns on
+# discovery, opens the command port, starts the agent, and puts the
+# pill on the bar. The desktop user does not type those commands.
+
+plugin_id=io.github.mariusfanu.nudgelan
+plugin_src=/usr/share/nudgelan/plugins/$plugin_id
+omarchy_path="${OMARCHY_PATH:-/usr/share/omarchy}"
+
+target_users() {
+  if [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != root ]; then
+    printf '%s\n' "$SUDO_USER"
+    return 0
+  fi
+  loginctl list-users --no-legend 2>/dev/null | awk '{print $2}'
+}
+
+user_home() {
+  getent passwd "$1" | cut -d: -f6
+}
+
+as_user() {
+  user=$1
+  shift
+  uid=$(id -u "$user")
+  home=$(user_home "$user")
+  runuser -u "$user" -- env \
+    HOME="$home" \
+    USER="$user" \
+    LOGNAME="$user" \
+    XDG_RUNTIME_DIR="/run/user/$uid" \
+    DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" \
+    OMARCHY_PATH="$omarchy_path" \
+    PATH="/usr/bin:/bin" \
+    "$@"
+}
+
+copy_plugin() {
+  user=$1
+  home=$(user_home "$user")
+  group=$(id -gn "$user")
+  dest="$home/.config/omarchy/plugins/$plugin_id"
+  install -d -o "$user" -g "$group" -m 755 "$home/.config/omarchy" "$home/.config/omarchy/plugins"
+  rm -rf "$dest"
+  mkdir -p "$dest"
+  cp -a "$plugin_src/." "$dest/"
+  chown -R "$user:$group" "$dest"
+}
+
+place_in_shell_json() {
+  user=$1
+  home=$(user_home "$user")
+  group=$(id -gn "$user")
+  config="$home/.config/omarchy/shell.json"
+  source_file=$config
+  if [ ! -s "$source_file" ]; then
+    source_file="$omarchy_path/config/omarchy/shell.json"
+  fi
+  [ -s "$source_file" ] || return 1
+  tmp=$(mktemp)
+  jq -S --arg id "$plugin_id" '
+    def object_or_empty: if type == "object" then . else {} end;
+    def array_or_empty: if type == "array" then . else [] end;
+    def entry_id: if type == "object" then .id else . end;
+    object_or_empty
+    | .version = 1
+    | .bar = (.bar | object_or_empty)
+    | .bar.layout = (.bar.layout | object_or_empty)
+    | .bar.layout.left = (.bar.layout.left | array_or_empty)
+    | .bar.layout.center = (.bar.layout.center | array_or_empty)
+    | .bar.layout.right = (.bar.layout.right | array_or_empty)
+    | .plugins = (.plugins | array_or_empty)
+    | if ([.bar.layout.left[], .bar.layout.center[], .bar.layout.right[], .plugins[]] | map(entry_id) | index($id)) != null then .
+      else .bar.layout.right += [{"id": $id}]
+      end
+  ' "$source_file" >"$tmp"
+  install -d -o "$user" -g "$group" -m 755 "$home/.config/omarchy"
+  install -o "$user" -g "$group" -m 644 "$tmp" "$config"
+  rm -f "$tmp"
+}
+
+strip_shell_json() {
+  user=$1
+  home=$(user_home "$user")
+  group=$(id -gn "$user")
+  config="$home/.config/omarchy/shell.json"
+  [ -s "$config" ] || return 0
+  tmp=$(mktemp)
+  jq -S --arg id "$plugin_id" '
+    def entry_id: if type == "object" then .id else . end;
+    def kept: if type == "array" then map(select(entry_id != $id)) else . end;
+    .bar.layout.left |= kept
+    | .bar.layout.center |= kept
+    | .bar.layout.right |= kept
+    | .plugins |= kept
+  ' "$config" >"$tmp"
+  install -o "$user" -g "$group" -m 644 "$tmp" "$config"
+  rm -f "$tmp"
+}
+
+enable_plugin() {
+  user=$1
+  uid=$(id -u "$user")
+  if [ ! -d "/run/user/$uid" ]; then
+    place_in_shell_json "$user"
+    echo "==> $user is not logged in. The NudgeLAN pill appears at the next graphical login."
+    return 0
+  fi
+  if ! as_user "$user" omarchy-shell shell ping >/dev/null 2>&1; then
+    place_in_shell_json "$user"
+    echo "==> The Omarchy shell is not running. The NudgeLAN pill appears at the next login."
+    return 0
+  fi
+  as_user "$user" omarchy-shell shell rescanPlugins >/dev/null 2>&1 || true
+  if as_user "$user" omarchy plugin enable "$plugin_id" --section right; then
+    return 0
+  fi
+  sleep 1
+  as_user "$user" omarchy-shell shell rescanPlugins >/dev/null 2>&1 || true
+  as_user "$user" omarchy plugin enable "$plugin_id" --section right
+}
+
+start_agent() {
+  user=$1
+  uid=$(id -u "$user")
+  [ -d "/run/user/$uid" ] || return 0
+  # configure_user handles startup failures, so do not rely on errexit here.
+  as_user "$user" systemctl --user daemon-reload || return 1
+  if as_user "$user" systemctl --user --quiet is-active nudgelan-agent.service; then
+    as_user "$user" systemctl --user restart nudgelan-agent.service
+  else
+    as_user "$user" systemctl --user start nudgelan-agent.service
+  fi
+}
+
+# The panel treats the port as open only when UFW has an interface rule for
+# the address the agent is actually bound to. A generic allow does not count.
+open_command_port() {
+  user=$1
+  uid=$(id -u "$user")
+  status="/run/user/$uid/nudgelan/status.json"
+  if [ ! -f /etc/ufw/ufw.conf ] || ! grep -q '^ENABLED=yes' /etc/ufw/ufw.conf; then
+    echo "==> UFW is off. The command port is reachable."
+    return 0
+  fi
+  if [ ! -d "/run/user/$uid" ] || ! as_user "$user" systemctl --user --quiet is-active nudgelan-agent.service; then
+    echo "==> Firewall setup for $user is pending. Once the agent is listening, allow the LAN port from the NudgeLAN panel."
+    return 0
+  fi
+  attempt=0
+  while [ "$attempt" -lt 20 ]; do
+    if [ -s "$status" ] && jq -e '.listening == true and (.host | length) > 0 and .port > 0' "$status" >/dev/null; then
+      host=$(jq -r '.host' "$status")
+      port=$(jq -r '.port' "$status")
+      if /usr/lib/nudgelan/nudgelan-firewall-configure --apply "$host" "$port"; then
+        return 0
+      fi
+    fi
+    attempt=$((attempt + 1))
+    sleep 0.5
+  done
+  echo "==> NudgeLAN could not open the command port for $user." >&2
+  return 1
+}
+
+configure_user() {
+  user=$1
+  # Start the agent before the pill loads, or the shell reports it as down.
+  if start_agent "$user"; then
+    open_command_port "$user" || echo "==> Warning: firewall setup for $user is pending. Once the agent is listening, allow the LAN port from the NudgeLAN panel." >&2
+  else
+    echo "==> Warning: NudgeLAN could not start for $user. Check the user service; once it is listening, allow the LAN port from the NudgeLAN panel if needed." >&2
+  fi
+  copy_plugin "$user"
+  enable_plugin "$user"
+}
+
+setup_machine() {
+  systemctl enable --now avahi-daemon
+  systemctl --global enable nudgelan-agent.service
+  found=0
+  while IFS= read -r user; do
+    [ -n "$user" ] || continue
+    found=1
+    configure_user "$user"
+  done <<EOF
+$(target_users)
+EOF
+  if [ "$found" -ne 1 ]; then
+    echo "==> NudgeLAN could not find the desktop user to enable the pill." >&2
+    return 1
+  fi
+}
+
+remove_firewall_rules() {
+  [ -x /usr/bin/ufw ] || return 0
+  nums=$(ufw status numbered 2>/dev/null | sed -n 's/.*\[\s*\([0-9][0-9]*\)\].*# nudgelan.*/\1/p' | sort -nr || true)
+  for n in $nums; do
+    ufw --force delete "$n" || true
+  done
+}
+
+users_with_nudgelan() {
+  getent passwd | while IFS=: read -r name _uid _gid _gecos home _shell; do
+    [ -n "$home" ] && [ "$home" != "/" ] || continue
+    plugin_path="$home/.config/omarchy/plugins/$plugin_id"
+    if [ -e "$plugin_path" ] || [ -L "$plugin_path" ]; then
+      printf '%s\n' "$name"
+      continue
+    fi
+    if [ -f "$home/.config/omarchy/shell.json" ] && grep -q "$plugin_id" "$home/.config/omarchy/shell.json"; then
+      printf '%s\n' "$name"
+    fi
+  done
+}
+
+hide_plugin() {
+  user=$1
+  uid=$(id -u "$user")
+  [ -d "/run/user/$uid" ] || return 0
+  # Ask the running shell to drop the pill. Editing shell.json alone leaves it
+  # on screen until the next login.
+  as_user "$user" omarchy plugin disable "$plugin_id" >/dev/null 2>&1 || true
+}
+
+remove_user() {
+  user=$1
+  home=$(user_home "$user")
+  [ -n "$home" ] || return 0
+  uid=$(id -u "$user")
+  if [ -d "/run/user/$uid" ]; then
+    as_user "$user" systemctl --user disable --now nudgelan-agent.service >/dev/null 2>&1 || true
+  fi
+  strip_shell_json "$user" || true
+  rm -rf \
+    "$home/.config/omarchy/plugins/$plugin_id" \
+    "$home/.config/nudgelan" \
+    "$home/.local/state/nudgelan" \
+    "$home/.config/omarchy/nudgelan-listening.json"
+  if [ -d "/run/user/$uid" ]; then
+    rm -rf "/run/user/$uid/nudgelan"
+  fi
+  if [ -d "/run/user/$uid" ]; then
+    as_user "$user" omarchy-shell shell reloadConfig >/dev/null 2>&1 || true
+    as_user "$user" omarchy-shell shell rescanPlugins >/dev/null 2>&1 || true
+  fi
+}
+
+post_install() {
+  set -euo pipefail
+  setup_machine
+}
+
+post_upgrade() {
+  set -euo pipefail
+  setup_machine
+}
+
+# Runs before pacman deletes /usr. The shell can still see the plugin and
+# removes the pill from the bar immediately.
+pre_remove() {
+  set -euo pipefail
+  while IFS= read -r user; do
+    [ -n "$user" ] || continue
+    hide_plugin "$user"
+  done <<EOF
+$(users_with_nudgelan)
+EOF
+}
+
+post_remove() {
+  set -euo pipefail
+  systemctl --global disable nudgelan-agent.service || true
+  remove_firewall_rules
+  while IFS= read -r user; do
+    [ -n "$user" ] || continue
+    remove_user "$user"
+  done <<EOF
+$(users_with_nudgelan)
+EOF
+}
