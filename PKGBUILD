@@ -2,7 +2,7 @@
 # Binary package. It downloads the public release and installs files under /usr.
 # The install script starts the agent, opens the command port, and puts the pill on the bar.
 pkgname=nudgelan-agent-bin
-pkgver=1.0.0
+pkgver=2.0.0
 pkgrel=1
 pkgdesc='Linux companion for NudgeLAN, a local-network utility for device discovery and remote wake/control actions.'
 arch=('x86_64')
@@ -14,7 +14,7 @@ conflicts=('nudgelan-agent')
 options=('!strip' '!debug')
 install=nudgelan-agent.install
 source=("$url/releases/download/v$pkgver/nudgelan-agent-$pkgver-x86_64.tar.gz")
-sha256sums=('da47329f78c35f1a1825cb461bc8a7f920f64a818c80633eaec459361d1a79a0')
+sha256sums=('61c14c7c333e894b8ea0f7bee27928a76706e986e71759b22ac6ded4e2939862')
 
 package() {
   cd "nudgelan-agent-$pkgver-x86_64"

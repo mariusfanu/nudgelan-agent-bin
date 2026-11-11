@@ -35,29 +35,30 @@ as_user() {
 }
 
 copy_plugin() {
-  user=$1
-  home=$(user_home "$user")
-  group=$(id -gn "$user")
-  dest="$home/.config/omarchy/plugins/$plugin_id"
-  install -d -o "$user" -g "$group" -m 755 "$home/.config/omarchy" "$home/.config/omarchy/plugins"
-  rm -rf "$dest"
-  mkdir -p "$dest"
-  cp -a "$plugin_src/." "$dest/"
-  chown -R "$user:$group" "$dest"
+  # Home directories belong to the desktop user. Never follow their symlinks
+  # while running as root, including during package upgrades and removal.
+  as_user "$1" sh -eu -s -- "$plugin_src" "$plugin_id" <<'SH'
+source=$1
+dest="$HOME/.config/omarchy/plugins/$2"
+mkdir -p "$HOME/.config/omarchy/plugins"
+rm -rf -- "$dest"
+mkdir -p "$dest"
+cp -R -- "$source/." "$dest/"
+SH
 }
 
 place_in_shell_json() {
-  user=$1
-  home=$(user_home "$user")
-  group=$(id -gn "$user")
-  config="$home/.config/omarchy/shell.json"
-  source_file=$config
-  if [ ! -s "$source_file" ]; then
-    source_file="$omarchy_path/config/omarchy/shell.json"
-  fi
-  [ -s "$source_file" ] || return 1
-  tmp=$(mktemp)
-  jq -S --arg id "$plugin_id" '
+  as_user "$1" sh -eu -s -- "$plugin_id" "$omarchy_path" <<'SH'
+config="$HOME/.config/omarchy/shell.json"
+source_file=$config
+if [ ! -s "$source_file" ]; then
+  source_file="$2/config/omarchy/shell.json"
+fi
+[ -s "$source_file" ] || exit 1
+mkdir -p "$HOME/.config/omarchy"
+tmp=$(mktemp "$config.XXXXXX")
+trap 'rm -f -- "$tmp"' EXIT HUP INT TERM
+jq -S --arg id "$1" '
     def object_or_empty: if type == "object" then . else {} end;
     def array_or_empty: if type == "array" then . else [] end;
     def entry_id: if type == "object" then .id else . end;
@@ -72,29 +73,29 @@ place_in_shell_json() {
     | if ([.bar.layout.left[], .bar.layout.center[], .bar.layout.right[], .plugins[]] | map(entry_id) | index($id)) != null then .
       else .bar.layout.right += [{"id": $id}]
       end
-  ' "$source_file" >"$tmp"
-  install -d -o "$user" -g "$group" -m 755 "$home/.config/omarchy"
-  install -o "$user" -g "$group" -m 644 "$tmp" "$config"
-  rm -f "$tmp"
+' "$source_file" >"$tmp" || exit 1
+chmod 644 "$tmp"
+mv -f -- "$tmp" "$config"
+SH
 }
 
 strip_shell_json() {
-  user=$1
-  home=$(user_home "$user")
-  group=$(id -gn "$user")
-  config="$home/.config/omarchy/shell.json"
-  [ -s "$config" ] || return 0
-  tmp=$(mktemp)
-  jq -S --arg id "$plugin_id" '
+  as_user "$1" sh -eu -s -- "$plugin_id" <<'SH'
+config="$HOME/.config/omarchy/shell.json"
+[ -s "$config" ] || exit 0
+tmp=$(mktemp "$config.XXXXXX")
+trap 'rm -f -- "$tmp"' EXIT HUP INT TERM
+jq -S --arg id "$1" '
     def entry_id: if type == "object" then .id else . end;
     def kept: if type == "array" then map(select(entry_id != $id)) else . end;
     .bar.layout.left |= kept
     | .bar.layout.center |= kept
     | .bar.layout.right |= kept
     | .plugins |= kept
-  ' "$config" >"$tmp"
-  install -o "$user" -g "$group" -m 644 "$tmp" "$config"
-  rm -f "$tmp"
+' "$config" >"$tmp" || exit 1
+chmod 644 "$tmp"
+mv -f -- "$tmp" "$config"
+SH
 }
 
 enable_plugin() {
@@ -200,7 +201,7 @@ remove_firewall_rules() {
 }
 
 users_with_nudgelan() {
-  getent passwd | while IFS=: read -r name _uid _gid _gecos home _shell; do
+  getent passwd | while IFS=: read -r name _password _uid _gid _gecos home _shell; do
     [ -n "$home" ] && [ "$home" != "/" ] || continue
     plugin_path="$home/.config/omarchy/plugins/$plugin_id"
     if [ -e "$plugin_path" ] || [ -L "$plugin_path" ]; then
@@ -231,13 +232,13 @@ remove_user() {
     as_user "$user" systemctl --user disable --now nudgelan-agent.service >/dev/null 2>&1 || true
   fi
   strip_shell_json "$user" || true
-  rm -rf \
+  as_user "$user" rm -rf -- \
     "$home/.config/omarchy/plugins/$plugin_id" \
     "$home/.config/nudgelan" \
     "$home/.local/state/nudgelan" \
     "$home/.config/omarchy/nudgelan-listening.json"
   if [ -d "/run/user/$uid" ]; then
-    rm -rf "/run/user/$uid/nudgelan"
+    as_user "$user" rm -rf -- "/run/user/$uid/nudgelan"
   fi
   if [ -d "/run/user/$uid" ]; then
     as_user "$user" omarchy-shell shell reloadConfig >/dev/null 2>&1 || true
