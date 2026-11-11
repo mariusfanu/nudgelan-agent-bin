@@ -253,7 +253,21 @@ post_install() {
 
 post_upgrade() {
   set -euo pipefail
-  setup_machine
+  local user
+  while IFS= read -r user; do
+    [ -n "$user" ] || continue
+    if as_user "$user" systemctl --user daemon-reload 2>/dev/null; then
+      as_user "$user" systemctl --user try-restart nudgelan-agent.service || \
+        echo "==> Warning: Could not restart NudgeLAN for $user." >&2
+    fi
+    if copy_plugin "$user"; then
+      as_user "$user" omarchy-shell shell rescanPlugins >/dev/null 2>&1 || true
+    else
+      echo "==> Warning: Could not refresh the NudgeLAN plugin for $user." >&2
+    fi
+  done <<EOF
+$(users_with_nudgelan)
+EOF
 }
 
 # Runs before pacman deletes /usr. The shell can still see the plugin and
