@@ -253,15 +253,24 @@ post_install() {
 
 post_upgrade() {
   set -euo pipefail
-  local user
+  local user previous_keep_loaded
   while IFS= read -r user; do
     [ -n "$user" ] || continue
+    previous_keep_loaded=false
+    if as_user "$user" sh -c 'jq -e ".keepLoaded == true" "$HOME/.config/omarchy/plugins/$1/manifest.json"' \
+      sh "$plugin_id" >/dev/null 2>&1; then
+      previous_keep_loaded=true
+    fi
     if as_user "$user" systemctl --user daemon-reload 2>/dev/null; then
       as_user "$user" systemctl --user try-restart nudgelan-agent.service || \
         echo "==> Warning: Could not restart NudgeLAN for $user." >&2
     fi
     if copy_plugin "$user"; then
-      as_user "$user" omarchy-shell shell rescanPlugins >/dev/null 2>&1 || true
+      if as_user "$user" omarchy-shell shell rescanPlugins >/dev/null 2>&1 &&
+        [ "$previous_keep_loaded" = true ]; then
+        # The first scan reads the new manifest. The next reload can evict the kept service.
+        as_user "$user" omarchy-shell shell rescanPlugins >/dev/null 2>&1 || true
+      fi
     else
       echo "==> Warning: Could not refresh the NudgeLAN plugin for $user." >&2
     fi
