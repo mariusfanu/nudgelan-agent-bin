@@ -1,3 +1,4 @@
+# shellcheck shell=bash
 # pacman runs this as root after the files are in place. It turns on
 # discovery, opens the command port, starts the agent, and puts the
 # pill on the bar. The desktop user does not type those commands.
@@ -18,17 +19,24 @@ user_home() {
   getent passwd "$1" | cut -d: -f6
 }
 
+runtime_dir_for() {
+  local uid
+  uid=$(id -u "$1") || return
+  printf '/run/user/%s\n' "$uid"
+}
+
 as_user() {
+  local user runtime_dir home
   user=$1
   shift
-  uid=$(id -u "$user")
+  runtime_dir=$(runtime_dir_for "$user") || return
   home=$(user_home "$user")
   runuser -u "$user" -- env \
     HOME="$home" \
     USER="$user" \
     LOGNAME="$user" \
-    XDG_RUNTIME_DIR="/run/user/$uid" \
-    DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" \
+    XDG_RUNTIME_DIR="$runtime_dir" \
+    DBUS_SESSION_BUS_ADDRESS="unix:path=$runtime_dir/bus" \
     OMARCHY_PATH="$omarchy_path" \
     PATH="/usr/bin:/bin" \
     "$@"
@@ -99,9 +107,10 @@ SH
 }
 
 enable_plugin() {
+  local user runtime_dir
   user=$1
-  uid=$(id -u "$user")
-  if [ ! -d "/run/user/$uid" ]; then
+  runtime_dir=$(runtime_dir_for "$user") || return
+  if [ ! -d "$runtime_dir" ]; then
     place_in_shell_json "$user"
     echo "==> $user is not logged in. The NudgeLAN pill appears at the next graphical login."
     return 0
@@ -121,9 +130,10 @@ enable_plugin() {
 }
 
 start_agent() {
+  local user runtime_dir
   user=$1
-  uid=$(id -u "$user")
-  [ -d "/run/user/$uid" ] || return 0
+  runtime_dir=$(runtime_dir_for "$user") || return
+  [ -d "$runtime_dir" ] || return 0
   # configure_user handles startup failures, so do not rely on errexit here.
   as_user "$user" systemctl --user daemon-reload || return 1
   if as_user "$user" systemctl --user --quiet is-active nudgelan-agent.service; then
@@ -136,14 +146,16 @@ start_agent() {
 # The panel treats the port as open only when UFW has an interface rule for
 # the address the agent is actually bound to. A generic allow does not count.
 open_command_port() {
+  local user runtime_dir uid status attempt host port
   user=$1
-  uid=$(id -u "$user")
-  status="/run/user/$uid/nudgelan/status.json"
+  runtime_dir=$(runtime_dir_for "$user") || return
+  uid=${runtime_dir##*/}
+  status="$runtime_dir/nudgelan/status.json"
   if [ ! -f /etc/ufw/ufw.conf ] || ! grep -q '^ENABLED=yes' /etc/ufw/ufw.conf; then
     echo "==> UFW is off. The command port is reachable."
     return 0
   fi
-  if [ ! -d "/run/user/$uid" ] || ! as_user "$user" systemctl --user --quiet is-active nudgelan-agent.service; then
+  if [ ! -d "$runtime_dir" ] || ! as_user "$user" systemctl --user --quiet is-active nudgelan-agent.service; then
     echo "==> Firewall setup for $user is pending. Once the agent is listening, allow the LAN port from the NudgeLAN panel."
     return 0
   fi
@@ -152,7 +164,7 @@ open_command_port() {
     if [ -s "$status" ] && jq -e '.listening == true and (.host | length) > 0 and .port > 0' "$status" >/dev/null; then
       host=$(jq -r '.host' "$status")
       port=$(jq -r '.port' "$status")
-      if /usr/lib/nudgelan/nudgelan-firewall-configure --apply "$host" "$port"; then
+      if /usr/lib/nudgelan/nudgelan-firewall-configure --apply "$host" "$port" --owner-uid "$uid"; then
         return 0
       fi
     fi
@@ -164,6 +176,7 @@ open_command_port() {
 }
 
 configure_user() {
+  local user
   user=$1
   # Start the agent before the pill loads, or the shell reports it as down.
   if start_agent "$user"; then
@@ -176,6 +189,7 @@ configure_user() {
 }
 
 setup_machine() {
+  local found user
   systemctl enable --now avahi-daemon
   systemctl --global enable nudgelan-agent.service
   found=0
@@ -193,14 +207,13 @@ EOF
 }
 
 remove_firewall_rules() {
-  [ -x /usr/bin/ufw ] || return 0
-  nums=$(ufw status numbered 2>/dev/null | sed -n 's/.*\[\s*\([0-9][0-9]*\)\].*# nudgelan.*/\1/p' | sort -nr || true)
-  for n in $nums; do
-    ufw --force delete "$n" || true
-  done
+  if [ -x /usr/lib/nudgelan/nudgelan-firewall-configure ]; then
+    /usr/lib/nudgelan/nudgelan-firewall-configure --remove-all >/dev/null || true
+  fi
 }
 
 users_with_nudgelan() {
+  local name _password _uid _gid _gecos home _shell plugin_path
   getent passwd | while IFS=: read -r name _password _uid _gid _gecos home _shell; do
     [ -n "$home" ] && [ "$home" != "/" ] || continue
     plugin_path="$home/.config/omarchy/plugins/$plugin_id"
@@ -215,20 +228,22 @@ users_with_nudgelan() {
 }
 
 hide_plugin() {
+  local user runtime_dir
   user=$1
-  uid=$(id -u "$user")
-  [ -d "/run/user/$uid" ] || return 0
+  runtime_dir=$(runtime_dir_for "$user") || return
+  [ -d "$runtime_dir" ] || return 0
   # Ask the running shell to drop the pill. Editing shell.json alone leaves it
   # on screen until the next login.
   as_user "$user" omarchy plugin disable "$plugin_id" >/dev/null 2>&1 || true
 }
 
 remove_user() {
+  local user home runtime_dir
   user=$1
   home=$(user_home "$user")
   [ -n "$home" ] || return 0
-  uid=$(id -u "$user")
-  if [ -d "/run/user/$uid" ]; then
+  runtime_dir=$(runtime_dir_for "$user") || return
+  if [ -d "$runtime_dir" ]; then
     as_user "$user" systemctl --user disable --now nudgelan-agent.service >/dev/null 2>&1 || true
   fi
   strip_shell_json "$user" || true
@@ -237,10 +252,8 @@ remove_user() {
     "$home/.config/nudgelan" \
     "$home/.local/state/nudgelan" \
     "$home/.config/omarchy/nudgelan-listening.json"
-  if [ -d "/run/user/$uid" ]; then
-    as_user "$user" rm -rf -- "/run/user/$uid/nudgelan"
-  fi
-  if [ -d "/run/user/$uid" ]; then
+  if [ -d "$runtime_dir" ]; then
+    as_user "$user" rm -rf -- "$runtime_dir/nudgelan"
     as_user "$user" omarchy-shell shell reloadConfig >/dev/null 2>&1 || true
     as_user "$user" omarchy-shell shell rescanPlugins >/dev/null 2>&1 || true
   fi
@@ -283,18 +296,21 @@ EOF
 # removes the pill from the bar immediately.
 pre_remove() {
   set -euo pipefail
+  local user
   while IFS= read -r user; do
     [ -n "$user" ] || continue
     hide_plugin "$user"
   done <<EOF
 $(users_with_nudgelan)
 EOF
+  # The helper is still installed during pre_remove.
+  remove_firewall_rules
 }
 
 post_remove() {
   set -euo pipefail
+  local user
   systemctl --global disable nudgelan-agent.service || true
-  remove_firewall_rules
   while IFS= read -r user; do
     [ -n "$user" ] || continue
     remove_user "$user"

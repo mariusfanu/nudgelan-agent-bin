@@ -1,6 +1,6 @@
 pkgbase = nudgelan-agent-bin
 	pkgdesc = Linux companion for NudgeLAN, a local-network utility for device discovery and remote wake/control actions.
-	pkgver = 2.1.1
+	pkgver = 2.2.0
 	pkgrel = 1
 	url = https://github.com/mariusfanu/nudgelan-agent-bin
 	install = nudgelan-agent.install
@@ -18,11 +18,11 @@ pkgbase = nudgelan-agent-bin
 	depends = curl
 	depends = gnupg
 	depends = libarchive
-	provides = nudgelan-agent=2.1.1
+	provides = nudgelan-agent=2.2.0
 	conflicts = nudgelan-agent
 	options = !strip
 	options = !debug
-	source = https://github.com/mariusfanu/nudgelan-agent-bin/releases/download/v2.1.1/nudgelan-agent-2.1.1-x86_64.tar.gz
-	sha256sums = 1243f2f51193651fb0c5b9c260823fdc8a895959feac798e2d541a18efc24b8c
+	source = https://github.com/mariusfanu/nudgelan-agent-bin/releases/download/v2.2.0/nudgelan-agent-2.2.0-x86_64.tar.gz
+	sha256sums = f3a27f3586a0c3b74109a481bb1b5f9d9dd2107d5dc9f0ffbc137b556f01b802
 
 pkgname = nudgelan-agent-bin
